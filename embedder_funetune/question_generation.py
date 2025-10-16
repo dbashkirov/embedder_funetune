@@ -39,6 +39,7 @@ class QuestionGenerationConfig:
     top_p: float = 0.9
     max_chunks: Optional[int] = None
     batch_size: int = 64
+    question_count: int = 5
     prompt_variables: Dict[str, str] = field(default_factory=dict)
 
 
@@ -177,7 +178,7 @@ class QuestionGenerator:
             logging.basicConfig(level=logging.INFO)
 
     def generate(self) -> Path:
-        """Generate question-answer pairs and persist them as JSONL."""
+        """Generate questions for each chunk and persist them as JSONL pairs."""
 
         output_path = Path(self.config.output_path)
         output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -187,28 +188,32 @@ class QuestionGenerator:
             logger.info("Generating questions for chunk %s", chunk.id)
             prompt = self._format_prompt(chunk)
             try:
-                qa_pairs = self._call_model(prompt)
+                questions = self._call_model(prompt)
             except Exception:  # pragma: no cover - propagate but log
-                logger.exception("Failed to generate QA pairs for chunk %s", chunk.id)
+                logger.exception("Failed to generate questions for chunk %s", chunk.id)
                 continue
 
-            for pair in qa_pairs:
-                question = pair.get("question")
-                answer = pair.get("answer")
-                if not question or not answer:
-                    logger.debug("Skipping malformed pair for chunk %s: %s", chunk.id, pair)
+            answer_text = chunk.text.strip()
+            if not answer_text:
+                logger.debug("Skipping chunk %s with empty answer text", chunk.id)
+                continue
+
+            for question in questions:
+                question_text = question.strip()
+                if not question_text:
+                    logger.debug("Skipping empty question for chunk %s", chunk.id)
                     continue
                 rows.append(
                     {
                         "chunk_id": chunk.id,
-                        "question": question.strip(),
-                        "answer": answer.strip(),
+                        "question": question_text,
+                        "answer": answer_text,
                         "metadata": chunk.metadata,
                     }
                 )
 
         if not rows:
-            raise RuntimeError("No question-answer pairs were generated. Check model outputs and prompt formatting.")
+            raise RuntimeError("No questions were generated. Check model outputs and prompt formatting.")
 
         with output_path.open("w", encoding="utf-8") as fp:
             for row in rows:
@@ -229,9 +234,17 @@ class QuestionGenerator:
         variables = dict(self.config.prompt_variables)
         variables.setdefault("context", chunk.text)
         variables.setdefault("metadata", json.dumps(chunk.metadata, ensure_ascii=False))
-        return self._prompt_template.format(**variables)
+        variables.setdefault("question_count", str(self.config.question_count))
+        base_prompt = self._prompt_template.format(**variables).rstrip()
+        format_instructions = (
+            "\n\n"
+            "Ответ верни строго в формате JSON-объекта с ключом \"questions\" и списком строк вопросов. "
+            "Пример: {\"questions\": [\"Вопрос 1?\", \"Вопрос 2?\"]}. "
+            "Никаких дополнительных полей, комментариев или пояснений не добавляй."
+        )
+        return f"{base_prompt}{format_instructions}"
 
-    def _call_model(self, prompt: str) -> List[Dict[str, str]]:
+    def _call_model(self, prompt: str) -> List[str]:
         messages = []
         if self.config.system_prompt:
             messages.append({"role": "system", "content": self.config.system_prompt})
@@ -248,52 +261,58 @@ class QuestionGenerator:
         logger.debug("Raw model output: %s", content)
         parsed = self._parse_model_output(content)
         if not parsed:
-            raise ValueError("Model response did not contain any valid question-answer pairs")
+            raise ValueError("Model response did not contain any valid questions")
         return parsed
 
     @staticmethod
-    def _parse_model_output(content: str) -> List[Dict[str, str]]:
+    def _parse_model_output(content: str) -> List[str]:
         try:
             data = json.loads(content)
         except json.JSONDecodeError:
             return _parse_fallback(content)
 
         if isinstance(data, dict):
-            data = [data]
+            # Support responses shaped like {"questions": [...]} for robustness
+            if "questions" in data and isinstance(data["questions"], list):
+                data = data["questions"]
+            else:
+                data = [data]
         if not isinstance(data, list):
             return []
 
-        parsed_pairs: List[Dict[str, str]] = []
+        parsed_questions: List[str] = []
         for item in data:
-            if not isinstance(item, dict):
-                continue
-            question = item.get("question")
-            answer = item.get("answer")
-            if question and answer:
-                parsed_pairs.append({"question": str(question), "answer": str(answer)})
-        return parsed_pairs
+            if isinstance(item, str):
+                parsed_questions.append(item)
+            elif isinstance(item, dict):
+                question = item.get("question") or item.get("q")
+                if isinstance(question, str):
+                    parsed_questions.append(question)
+        cleaned = [question.strip() for question in parsed_questions if isinstance(question, str) and question.strip()]
+        return [question for question in cleaned if "?" in question]
 
 
-def _parse_fallback(content: str) -> List[Dict[str, str]]:
+def _parse_fallback(content: str) -> List[str]:
     """Fallback parser for simple textual outputs."""
 
-    pairs: List[Dict[str, str]] = []
-    current: Dict[str, Optional[str]] = {"question": None, "answer": None}
+    questions: List[str] = []
     for line in content.splitlines():
         line = line.strip()
         if not line:
             continue
         lower = line.lower()
         if lower.startswith("question:") or lower.startswith("q:"):
-            current["question"] = line.split(":", 1)[1].strip()
-        elif lower.startswith("answer:") or lower.startswith("a:"):
-            current["answer"] = line.split(":", 1)[1].strip()
-        elif current["question"] and current["answer"]:
-            pairs.append({"question": current["question"], "answer": current["answer"]})
-            current = {"question": None, "answer": None}
-    if current["question"] and current["answer"]:
-        pairs.append({"question": current["question"], "answer": current["answer"]})
-    return pairs
+            candidate = line.split(":", 1)[1].strip()
+        elif line[0].isdigit() and ("." in line or ")" in line):
+            delimiter = "." if "." in line else ")"
+            candidate = line.split(delimiter, 1)[1].strip()
+        elif line.startswith("-") or line.startswith("•"):
+            candidate = line[1:].strip()
+        else:
+            candidate = line
+        if "?" in candidate:
+            questions.append(candidate)
+    return questions
 
 
 __all__ = ["QuestionGenerator", "QuestionGenerationConfig"]
